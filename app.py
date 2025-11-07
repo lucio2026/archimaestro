@@ -1,27 +1,19 @@
 
 import os
-import uuid
-from flask import (
-    Flask,
-    request,
-    render_template_string,
-    send_from_directory,
-)
+from flask import Flask, request, render_template_string
 import ezdxf
 
 app = Flask(__name__)
-app.secret_key = "archimaestro-smart"
+app.secret_key = "archimaestro-secret"
 
-# cartella per i file caricati e per i risultati
+# cartella di upload
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# limiti
-MAX_FILE_MB = 50          # limite massimo accettato dal server
-PARSE_WITH_EZDXF_MB = 5   # sotto questo valore proviamo l’analisi “bella” con ezdxf
+# limite semplice (5 MB)
+MAX_FILE_SIZE_MB = 5
 
-# HTML INLINE
 PAGE = """
 <!DOCTYPE html>
 <html lang="it">
@@ -29,20 +21,22 @@ PAGE = """
     <meta charset="UTF-8">
     <title>Archimaestro Translator</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 820px; margin: 40px auto; }
+        body { font-family: Arial, sans-serif; max-width: 860px; margin: 40px auto; }
         h1 { margin-bottom: .3rem; }
-        form { margin: 1rem 0; }
-        textarea { width: 100%; height: 320px; }
+        form { margin: 1rem 0 1.5rem 0; }
+        textarea { width: 100%; box-sizing: border-box; }
         .msg { background: #ffe4e4; padding: .5rem .8rem; border: 1px solid #ffb4b4; margin-bottom: 1rem; }
         .ok { background: #e9fff0; border: 1px solid #b2f5c6; }
-        .download { margin-top: 1rem; }
-        a.btn { display:inline-block; padding: 6px 12px; background:#2b6cb0; color:#fff; text-decoration:none; border-radius:4px; }
-        a.btn:hover { background:#2c5282; }
+        .block { margin-bottom: 1.5rem; }
+        .label { font-weight: bold; margin-bottom: .4rem; display: block; }
+        .two { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        button { cursor: pointer; }
     </style>
 </head>
 <body>
     <h1>🏗️ Archimaestro Translator</h1>
-    <p>Carica un file <b>DXF</b> e vedi gli elementi. Se è molto grande lo leggo in modalità “smart”.</p>
+    <p>Carica un file <b>DXF</b> e ti mostro gli elementi. Se vuoi,
+       premo “Crea prompt per Grock” e ti preparo il testo già pronto da incollare.</p>
 
     {% if message %}
         <div class="msg">{{ message }}</div>
@@ -50,7 +44,9 @@ PAGE = """
 
     <form action="/upload" method="post" enctype="multipart/form-data">
         <input type="file" name="file" accept=".dxf" required>
-        <button type="submit">Carica e analizza</button>
+        <!-- due bottoni nello stesso form -->
+        <button type="submit" name="action" value="analyze">Carica e analizza</button>
+        <button type="submit" name="action" value="grock">Carica e crea prompt Grock</button>
     </form>
 
     {% if filename %}
@@ -58,21 +54,50 @@ PAGE = """
     {% endif %}
 
     {% if text_result %}
-        <textarea readonly>{{ text_result }}</textarea>
+        <div class="block">
+            <span class="label">Elementi trovati (max 200):</span>
+            <textarea rows="12" readonly>{{ text_result }}</textarea>
+        </div>
     {% endif %}
 
-    {% if download_id %}
-        <div class="download">
-            <a class="btn" href="{{ url_for('download_result', result_id=download_id) }}">⬇️ Scarica il risultato (.txt)</a>
+    {% if grock_prompt %}
+        <div class="block">
+            <span class="label">Prompt per Grock (copialo e incollalo):</span>
+            <textarea rows="15" readonly>{{ grock_prompt }}</textarea>
         </div>
     {% endif %}
 </body>
 </html>
 """
 
+def build_grock_prompt(filename: str, summary: dict) -> str:
+    """
+    summary è un dizionario con i conteggi per tipo e per layer.
+    Genero un testo che spiega a Grock cosa fare.
+    """
+    lines = []
+    lines.append(f"Ho caricato un disegno CAD (file: {filename}).")
+    lines.append("Queste sono le entità che ho trovato:")
 
-def file_size_mb(path: str) -> float:
-    return os.path.getsize(path) / (1024 * 1024)
+    # per tipo
+    if summary.get("by_type"):
+        for t, n in summary["by_type"].items():
+            lines.append(f"- {n} entità di tipo {t}")
+    # per layer
+    if summary.get("by_layer"):
+        lines.append("Per layer:")
+        for lay, n in summary["by_layer"].items():
+            lines.append(f"  - {n} oggetti sul layer “{lay}”")
+
+    lines.append("")
+    lines.append("Crea una breve animazione tecnica in 4 step:")
+    lines.append("1. mostra uno sfondo/griglia da tavola tecnica;")
+    lines.append("2. disegna prima i muri e i contorni (LINE, LWPOLYLINE, layer che contengono 'MURI' o 'PERIMETRO');")
+    lines.append("3. poi fai comparire gli elementi tecnici o di arredo;")
+    lines.append("4. alla fine mostra le scritte/cartiglio.")
+    lines.append("Stile: pulito, da presentazione architettonica.")
+
+    return "\n".join(lines)
 
 
 @app.route("/", methods=["GET"])
@@ -82,25 +107,33 @@ def index():
         message=None,
         text_result=None,
         filename=None,
-        download_id=None,
+        grock_prompt=None,
     )
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    upfile = request.files.get("file")
+    action = request.form.get("action", "analyze")  # 'analyze' o 'grock'
+    file = request.files.get("file")
 
-    if not upfile or upfile.filename == "":
+    if not file or file.filename == "":
+        return render_template_string(PAGE, message="Nessun file selezionato.", text_result=None, filename=None, grock_prompt=None)
+
+    filename = file.filename
+    lowername = filename.lower()
+
+    # controllo dimensione (in MB)
+    file.seek(0, os.SEEK_END)
+    size_mb = file.tell() / (1024 * 1024)
+    file.seek(0)
+    if size_mb > MAX_FILE_SIZE_MB:
         return render_template_string(
             PAGE,
-            message="Nessun file selezionato.",
+            message=f"File troppo grande ({size_mb:.1f} MB). Limite attuale: {MAX_FILE_SIZE_MB} MB.",
             text_result=None,
-            filename=None,
-            download_id=None,
+            filename=filename,
+            grock_prompt=None,
         )
-
-    filename = upfile.filename
-    lowername = filename.lower()
 
     if not lowername.endswith(".dxf"):
         return render_template_string(
@@ -108,87 +141,51 @@ def upload():
             message="Per ora il server accetta solo DXF. Esporta il DWG in DXF e ricarica.",
             text_result=None,
             filename=None,
-            download_id=None,
+            grock_prompt=None,
         )
 
-    # salviamo il file
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    upfile.save(save_path)
+    file.save(save_path)
 
-    size_mb = file_size_mb(save_path)
-    if size_mb > MAX_FILE_MB:
+    try:
+        doc = ezdxf.readfile(save_path)
+        msp = doc.modelspace()
+
+        elements = []
+        by_type = {}
+        by_layer = {}
+
+        for e in msp:
+            etype = e.dxftype()
+            layer = e.dxf.layer
+
+            elements.append(f"{etype}  |  layer={layer}")
+
+            by_type[etype] = by_type.get(etype, 0) + 1
+            by_layer[layer] = by_layer.get(layer, 0) + 1
+
+        text_result = "\n".join(elements[:200]) or "Nessun elemento trovato nel DXF."
+
+        grock_prompt = None
+        if action == "grock":
+            grock_prompt = build_grock_prompt(filename, {"by_type": by_type, "by_layer": by_layer})
+
         return render_template_string(
             PAGE,
-            message=f"File troppo grande ({size_mb:.1f} MB). Limite attuale: {MAX_FILE_MB} MB.",
+            message=None,
+            text_result=text_result,
+            filename=filename,
+            grock_prompt=grock_prompt,
+        )
+
+    except Exception as e:
+        return render_template_string(
+            PAGE,
+            message=f"Errore nella lettura del DXF: {e}",
             text_result=None,
             filename=filename,
-            download_id=None,
+            grock_prompt=None,
         )
-
-    # se il file è piccolo proviamo l'analisi vera con ezdxf
-    text_result = ""
-    info_msg = None
-
-    if size_mb <= PARSE_WITH_EZDXF_MB:
-        try:
-            doc = ezdxf.readfile(save_path)
-            msp = doc.modelspace()
-
-            elements = []
-            for e in msp:
-                elements.append(f"{e.dxftype()}  |  layer={e.dxf.layer}")
-            text_result = "\n".join(elements[:200]) or "Nessun elemento trovato nel DXF."
-        except Exception as e:
-            # fallback a lettura smart
-            info_msg = f"Analisi DXF completa non riuscita: {e}. Ho usato la lettura smart."
-            text_result = smart_read(save_path)
-    else:
-        # file grande: lettura smart
-        info_msg = (
-            f"File grande ({size_mb:.1f} MB). Ho fatto una lettura smart delle prime righe del DXF."
-        )
-        text_result = smart_read(save_path)
-
-    # salviamo il risultato in un .txt per il download
-    result_id = str(uuid.uuid4()) + ".txt"
-    result_path = os.path.join(app.config["UPLOAD_FOLDER"], result_id)
-    with open(result_path, "w", encoding="utf-8") as f:
-        f.write(text_result)
-
-    return render_template_string(
-        PAGE,
-        message=info_msg,
-        text_result=text_result,
-        filename=filename,
-        download_id=result_id,
-    )
-
-
-def smart_read(path: str, max_lines: int = 400) -> str:
-    """Legge il DXF come testo e restituisce le prime N righe.
-    Utile per file molto grandi o corrotti per ezdxf.
-    """
-    lines = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                lines.append(line.rstrip("\n"))
-    except Exception as e:
-        return f"Impossibile leggere il DXF in modalità smart: {e}"
-    return "\n".join(lines)
-
-
-@app.route("/download/<result_id>")
-def download_result(result_id):
-    # il file sta in uploads
-    return send_from_directory(
-        app.config["UPLOAD_FOLDER"],
-        result_id,
-        as_attachment=True,
-        download_name="archimaestro_risultato.txt",
-    )
 
 
 if __name__ == "__main__":
