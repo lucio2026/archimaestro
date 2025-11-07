@@ -1,192 +1,287 @@
-
 import os
 from flask import Flask, request, render_template_string
+import ezdxf
 
 app = Flask(__name__)
 app.secret_key = "archimaestro-secret"
 
+# cartella dove salvo temporaneamente i DXF
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-MAX_SIZE_MB = 5  # oltre questo facciamo modalità smart
+# limite "fisico" – oltre questo facciamo solo lettura smart
+MAX_SIZE = 5 * 1024 * 1024   # 5 MB
 
-HTML_PAGE = """
+# -----------------------------------------------------
+# HTML unico (una pagina sola)
+# -----------------------------------------------------
+PAGE = r"""
 <!DOCTYPE html>
 <html lang="it">
 <head>
     <meta charset="UTF-8">
-    <title>Archimaestro DXF → Grock</title>
+    <title>Archimaestro Translator</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 980px; margin: 40px auto; }
-        textarea { width: 100%; }
-        #dxf-box { height: 200px; }
-        #semantic-box { height: 140px; }
-        #prompt-box { height: 220px; }
-        .msg { background: #ffe4e4; padding: .5rem .8rem; border: 1px solid #ffb4b4; margin-bottom: 1rem; }
-        h1 { margin-bottom: 0.3rem; }
-        button { cursor: pointer; margin-right: .4rem; }
+        body { font-family: Arial, sans-serif; max-width: 980px; margin: 30px auto 80px; line-height: 1.4; }
+        h1 { display: flex; align-items: center; gap: .6rem; margin-bottom: .2rem; }
+        h1 span.logo { width: 26px; height: 26px; background: #ff9944; border-radius: 7px; display: inline-block; }
+        .sub { color: #555; margin-bottom: 1rem; }
+        .alert { background: #ffe4e4; border: 1px solid #ffb4b4; padding: .5rem .8rem; margin-bottom: 1rem; }
+        .ok { background: #edfdf3; border: 1px solid #c6f6d5; }
+        textarea { width: 100%; height: 180px; font-family: ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: .8rem; }
+        form { margin-bottom: 1rem; }
+        button { cursor: pointer; }
+        .btn { background: #f3f4f6; border: 1px solid #ccc; padding: .4rem .8rem; border-radius: 4px; }
+        .btn-primary { background: #ef4444; color: white; border-color: #ef4444; }
+        .section-title { margin: 1.6rem 0 .4rem; font-weight: bold; }
+        .muted { color: #666; font-size: .8rem; }
     </style>
+    <script>
+      function copiaPrompt() {
+        const el = document.getElementById('prompt_grock');
+        if (!el) return;
+        el.select();
+        el.setSelectionRange(0, 99999);
+        document.execCommand("copy");
+        alert("Prompt copiato!");
+      }
+    </script>
 </head>
 <body>
-    <h1>🏗️ Archimaestro – versione “Bagno realistico”</h1>
-    <p>Carica un DXF e genero: lettura tecnica → descrizione ambiente → prompt fotorealistico per Grock.</p>
+    <h1><span class="logo"></span> Archimaestro Translator</h1>
+    <div class="sub">Carica un DXF. Se è grande lo leggo in modalità “smart”. Puoi anche generare il prompt per Grock.</div>
 
     {% if message %}
-      <div class="msg">{{ message }}</div>
+      <div class="alert {{ 'ok' if ok else '' }}">{{ message }}</div>
     {% endif %}
 
     <form action="/upload" method="post" enctype="multipart/form-data">
         <input type="file" name="file" accept=".dxf" required>
-        <button type="submit" name="mode" value="analyze">Carica e analizza</button>
-        <button type="submit" name="mode" value="grock">Carica e crea prompt Grock</button>
+        <button type="submit" name="azione" value="analizza" class="btn">Carica e analizza</button>
+        <button type="submit" name="azione" value="prompt" class="btn">Carica e crea prompt Grock</button>
     </form>
 
     {% if filename %}
       <h2>File: {{ filename }}</h2>
     {% endif %}
 
-    {% if dxf_dump %}
-      <h3>1. Lettura tecnica (prime entità):</h3>
-      <textarea id="dxf-box" readonly>{{ dxf_dump }}</textarea>
+    {% if dxf_preview %}
+      <div class="section-title">1. Lettura tecnica (prime entità):</div>
+      <textarea readonly>{{ dxf_preview }}</textarea>
     {% endif %}
 
-    {% if semantic %}
-      <h3>2. Analisi semantica ambiente:</h3>
-      <textarea id="semantic-box" readonly>{{ semantic }}</textarea>
+    {% if ambiente %}
+      <div class="section-title">2. Analisi semantica ambiente:</div>
+      <textarea readonly>{{ ambiente }}</textarea>
     {% endif %}
 
-    {% if grock_prompt %}
-      <h3>3. Prompt fotorealistico per Grock:</h3>
-      <textarea id="prompt-box" readonly>{{ grock_prompt }}</textarea>
-      <p><button onclick="copyPrompt()">📋 Copia prompt</button></p>
+    {% if prompt_grock %}
+      <div class="section-title">3. Prompt fotorealistico per Grock:</div>
+      <textarea id="prompt_grock" readonly>{{ prompt_grock }}</textarea>
+      <p><button class="btn" onclick="copiaPrompt()">📋 Copia prompt</button></p>
     {% endif %}
 
-    <script>
-    function copyPrompt() {
-        const ta = document.getElementById('prompt-box');
-        if (!ta) return;
-        ta.select();
-        ta.setSelectionRange(0, 99999);
-        navigator.clipboard.writeText(ta.value).then(() => {
-            alert("✅ Prompt copiato negli appunti.");
-        });
-    }
-    </script>
+    <p class="muted">Link app: {{ app_url }}</p>
 </body>
 </html>
 """
 
-def read_dxf_smart(path, max_lines=200):
-    try:
-        lines = []
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                lines.append(line.rstrip("\n"))
-        return "\n".join(lines) if lines else "Nessun contenuto leggibile."
-    except Exception as e:
-        return f"Errore lettura smart: {e}"
+# -----------------------------------------------------
+# funzioni di utilità
+# -----------------------------------------------------
+def detect_locale(filename: str, text_snippet: str) -> str | None:
+    """Prova a capire che ambiente è dal nome file o dalle prime righe."""
+    name = (filename or "").lower()
+    txt = (text_snippet or "").lower()
 
-def analyze_dxf_semantic(entities_dump: str):
-    """Guarda il dump e prova a capire se è un bagno o stanza piccola."""
-    dump_low = entities_dump.lower()
-    is_bath = False
-    clues = []
+    # lista di (parole, etichetta)
+    mapping = [
+        (["bagno", "wc", "toilet"], "bagno"),
+        (["cucina", "kitchen"], "cucina"),
+        (["soggiorno", "living", "salone", "zona giorno"], "soggiorno"),
+        (["camera", "bedroom"], "camera da letto"),
+        (["ufficio", "office"], "ufficio"),
+    ]
 
-    # indizi dai layer
-    for kw in ["wc", "bagno", "sanitari", "arredo_bagno", "bidet"]:
-        if kw in dump_low:
-            is_bath = True
-            clues.append(f"Trovato layer o nome: {kw}")
+    for keywords, label in mapping:
+        for kw in keywords:
+            if kw in name or kw in txt:
+                return label
 
-    # se non ci sono indizi, ma è un disegno piccolo, lo dichiariamo generico
-    if is_bath:
-        return "Ambiente riconosciuto: BAGNO o locale sanitario. " + "; ".join(clues)
+    return None  # non riconosciuto
+
+
+def build_prompt_specifico(tipo: str, filename: str, info: str) -> str:
+    """Prompt quando sappiamo il tipo di ambiente."""
+    base = (
+        f"Ho caricato un disegno CAD (DXF) chiamato “{filename}”.\n"
+        f"Il contenuto sembra riferito a un {tipo}.\n"
+        "Genera un rendering fotorealistico coerente con un progetto architettonico.\n"
+        "Mantieni proporzioni e impostazione del disegno CAD.\n"
+    )
+
+    if tipo == "bagno":
+        extra = (
+            "Mostra un bagno moderno di piccole/medie dimensioni.\n"
+            "Inserisci sanitari e lavabo con mobile, doccia o vasca secondo logica, finiture chiare.\n"
+        )
+    elif tipo == "cucina":
+        extra = (
+            "Mostra una cucina moderna lineare o ad angolo, piani in materiale tecnico, pensili, zona lavello e cottura.\n"
+        )
+    elif tipo == "soggiorno":
+        extra = (
+            "Mostra una zona giorno luminosa con pavimento continuo, arredi essenziali, stile contemporaneo.\n"
+        )
+    elif tipo == "camera da letto":
+        extra = (
+            "Mostra una camera da letto con letto matrimoniale, comodini e armadio, toni neutri e luce morbida.\n"
+        )
+    elif tipo == "ufficio":
+        extra = (
+            "Mostra un piccolo ufficio/studio con scrivania, seduta ergonomica e scaffalature.\n"
+        )
     else:
-        return "Ambiente non chiaramente riconosciuto come bagno. Considerare descrizione manuale (bagno 2,5 x 1,8 m)."
+        extra = ""
 
-def build_grock_prompt_from_semantic(filename: str, semantic: str):
-    """Costruisco il super-prompt per Grock."""
-    base = []
-    base.append(f"Ho caricato un disegno CAD (DXF) chiamato “{filename}”.")
-    if "BAGNO" in semantic.upper():
-        base.append("Il contenuto sembra riferito a un BAGNO / locale sanitario.")
-        base.append("Genera un rendering fotorealistico di un bagno moderno di piccole dimensioni (circa 2,5 x 1,8 m).")
-        base.append("Imposta la camera a 1,5 m di altezza, vista leggermente angolata verso la parete principale.")
-        base.append("Pareti chiare (bianco o sabbia), pavimento in gres grigio chiaro.")
-        base.append("Inserisci: lavabo con specchio sulla parete frontale, wc e bidet sulla parete di destra, doccia a filo pavimento sul lato corto rimanente.")
-        base.append("Illuminazione morbida, con luce naturale da finestra alta o luce zenitale.")
-        base.append("Stile: architettura d’interni, pulito, senza persone.")
-    else:
-        base.append("Il contenuto non è stato riconosciuto automaticamente come bagno.")
-        base.append("Genera comunque un interno architettonico pulito, con pareti chiare e arredo minimale.")
-        base.append("Includi elementi sanitari se il contesto lo richiede.")
-    base.append("Mostra l’ambiente come se provenisse da un disegno tecnico CAD.")
-    return "\n".join(base)
+    coda = (
+        "Illuminazione morbida, da interno, senza persone.\n"
+        "Mostra l’ambiente come se provenisse da un disegno tecnico CAD ma reso.\n"
+        f"(Prime righe lette dal DXF, utili al modello):\n{info}\n"
+    )
 
+    return base + extra + coda
+
+
+def build_prompt_neutro(filename: str, info: str) -> str:
+    """Prompt quando non sappiamo che cos'è."""
+    return (
+        f"Ho caricato un disegno CAD (DXF) chiamato “{filename}”.\n"
+        "Il tipo di ambiente non è esplicito, quindi interpreta il DXF come un locale architettonico standard.\n"
+        "Genera un rendering fotorealistico dell'ambiente rispettando le proporzioni del disegno.\n"
+        "Usa materiali e colori neutri (pareti chiare, pavimento tecnico o gres).\n"
+        "Inquadratura leggermente angolata, stile presentazione architettonica.\n"
+        "Mostra l’ambiente come derivato da un disegno tecnico CAD.\n"
+        f"(Prime righe lette dal DXF, utili al modello):\n{info}\n"
+    )
+
+
+# -----------------------------------------------------
+# route principale
+# -----------------------------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(HTML_PAGE,
-                                  message=None,
-                                  filename=None,
-                                  dxf_dump=None,
-                                  semantic=None,
-                                  grock_prompt=None)
+    return render_template_string(
+        PAGE,
+        message=None,
+        ok=False,
+        filename=None,
+        dxf_preview=None,
+        ambiente=None,
+        prompt_grock=None,
+        app_url="https://archimaestro.onrender.com/"
+    )
+
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    upfile = request.files.get("file")
-    mode = request.form.get("mode", "analyze")
+    file = request.files.get("file")
+    azione = request.form.get("azione", "analizza")
 
-    if not upfile or upfile.filename == "":
-        return render_template_string(HTML_PAGE, message="Nessun file selezionato.",
-                                      filename=None, dxf_dump=None, semantic=None, grock_prompt=None)
+    if not file or file.filename == "":
+        return render_template_string(
+            PAGE,
+            message="Nessun file selezionato.",
+            ok=False,
+            filename=None,
+            dxf_preview=None,
+            ambiente=None,
+            prompt_grock=None,
+            app_url="https://archimaestro.onrender.com/"
+        )
 
-    filename = upfile.filename
+    filename = file.filename
     if not filename.lower().endswith(".dxf"):
-        return render_template_string(HTML_PAGE, message="Caricare solo DXF (esporta il DWG in DXF).",
-                                      filename=None, dxf_dump=None, semantic=None, grock_prompt=None)
+        return render_template_string(
+            PAGE,
+            message="Per ora il server accetta solo file DXF. Esporta il DWG in DXF e ricarica.",
+            ok=False,
+            filename=None,
+            dxf_preview=None,
+            ambiente=None,
+            prompt_grock=None,
+            app_url="https://archimaestro.onrender.com/"
+        )
 
+    # salvataggio
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    upfile.save(save_path)
+    file.save(save_path)
 
-    size_mb = os.path.getsize(save_path) / (1024 * 1024)
+    # controllo dimensione
+    file_size = os.path.getsize(save_path)
+    smart_mode = file_size > MAX_SIZE
 
-    # 1) lettura tecnica
-    if size_mb > MAX_SIZE_MB:
-        dxf_dump = read_dxf_smart(save_path, max_lines=250)
-        msg = f"File grande ({size_mb:.1f} MB). Lettura smart eseguita."
-    else:
-        # provo con ezdxf
-        try:
-            import ezdxf
+    try:
+        if smart_mode:
+            # lettura "smart": apriamo il file grezzo e prendiamo solo l'inizio
+            with open(save_path, "r", encoding="latin-1", errors="ignore") as f:
+                raw = f.readlines()
+            # prendo le prime 200 righe
+            preview_lines = raw[:200]
+            dxf_preview = "".join(preview_lines)
+            message = f"File grande ({round(file_size/1024/1024,1)} MB): lettura smart eseguita."
+        else:
+            # lettura normale con ezdxf
             doc = ezdxf.readfile(save_path)
             msp = doc.modelspace()
-            lines = []
+            preview_lines = []
             for e in msp:
-                lines.append(f"{e.dxftype()} | layer={e.dxf.layer}")
-            dxf_dump = "\n".join(lines[:250]) or "Nessun elemento trovato."
-            msg = None
-        except Exception as e:
-            dxf_dump = read_dxf_smart(save_path, max_lines=250)
-            msg = f"DXF complesso, uso lettura smart. Dettaglio: {e}"
+                preview_lines.append(f"{e.dxftype()} | layer={e.dxf.layer}")
+                if len(preview_lines) >= 200:
+                    break
+            dxf_preview = "\n".join(preview_lines)
+            message = "File letto correttamente."
+    except Exception as e:
+        return render_template_string(
+            PAGE,
+            message=f"Errore nella lettura del DXF: {e}",
+            ok=False,
+            filename=filename,
+            dxf_preview=None,
+            ambiente=None,
+            prompt_grock=None,
+            app_url="https://archimaestro.onrender.com/"
+        )
 
-    # 2) analisi semantica
-    semantic = analyze_dxf_semantic(dxf_dump)
+    # analisi semantica molto semplice
+    ambiente_rilevato = detect_locale(filename, dxf_preview)
+    if ambiente_rilevato:
+        ambiente_text = f"Ambiente riconosciuto come: {ambiente_rilevato}."
+    else:
+        ambiente_text = "Ambiente non chiaramente riconosciuto. Descriverlo meglio nel prompt se serve."
 
-    # 3) prompt per grock (solo se richiesto)
-    grock_prompt = None
-    if mode == "grock":
-        grock_prompt = build_grock_prompt_from_semantic(filename, semantic)
+    # se l’utente ha chiesto il prompt
+    if azione == "prompt":
+        if ambiente_rilevato:
+            prompt = build_prompt_specifico(ambiente_rilevato, filename, dxf_preview[:500])
+        else:
+            prompt = build_prompt_neutro(filename, dxf_preview[:500])
+    else:
+        prompt = None
 
-    return render_template_string(HTML_PAGE,
-                                  message=msg,
-                                  filename=filename,
-                                  dxf_dump=dxf_dump,
-                                  semantic=semantic,
-                                  grock_prompt=grock_prompt)
+    return render_template_string(
+        PAGE,
+        message=message,
+        ok=not smart_mode,
+        filename=filename,
+        dxf_preview=dxf_preview,
+        ambiente=ambiente_text,
+        prompt_grock=prompt,
+        app_url="https://archimaestro.onrender.com/"
+    )
+
 
 if __name__ == "__main__":
+    # per esecuzione locale
     app.run(debug=True)
