@@ -1,9 +1,10 @@
+
 import os
 from flask import Flask, render_template, request, redirect, url_for, flash
 import ezdxf
 
 app = Flask(__name__)
-app.secret_key = "metti-una-password-qualsiasi"
+app.secret_key = "metti-una-password-qualsiasi"  # puoi cambiarla
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -12,7 +13,7 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 @app.route("/", methods=["GET"])
 def index():
-    # pagina vuota la prima volta
+    # pagina iniziale
     return render_template("index.html")
 
 
@@ -27,7 +28,7 @@ def upload():
     filename = file.filename
     lowername = filename.lower()
 
-    # SU RENDER leggiamo solo DXF, il DWG farebbe crashare ezdxf
+    # su Render leggiamo solo DXF (il DWG spesso fa crashare ezdxf)
     if not lowername.endswith(".dxf"):
         flash("Per ora il server accetta solo file DXF. Esporta il DWG in DXF e ricarica.")
         return redirect(url_for("index"))
@@ -35,7 +36,6 @@ def upload():
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
     file.save(save_path)
 
-    # proviamo a leggere il DXF
     try:
         doc = ezdxf.readfile(save_path)
         msp = doc.modelspace()
@@ -51,6 +51,8 @@ def upload():
     return render_template("index.html", text_result=text_result, filename=filename)
 
 
+# ========= QUI IL PEZZO CHE MANCAVA =========
 if __name__ == "__main__":
-    # utile solo in locale; su Render usa gunicorn
-    app.run(host="0.0.0.0", port=5055, debug=True)
+    # Render passa la porta in una variabile d'ambiente chiamata PORT
+    port = int(os.environ.get("PORT", 5055))
+    app.run(host="0.0.0.0", port=port)
