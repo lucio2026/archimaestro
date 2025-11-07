@@ -1,6 +1,8 @@
+
 import os
-from flask import Flask, request, redirect, url_for, flash, render_template_string
+from flask import Flask, request, render_template_string
 import ezdxf
+from ezdxf.lldxf.const import DXFStructureError
 
 app = Flask(__name__)
 app.secret_key = "archimaestro-secret"
@@ -9,6 +11,9 @@ app.secret_key = "archimaestro-secret"
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
+# limite dimensione file (in MB) per non far saltare l'istanza free
+MAX_FILE_MB = 5  # puoi alzarlo, ma occhio alla RAM su Render
 
 # HTML INLINE (così non dipendiamo da /templates)
 PAGE = """
@@ -61,7 +66,12 @@ def upload():
     file = request.files.get("file")
 
     if not file or file.filename == "":
-        return render_template_string(PAGE, message="Nessun file selezionato.", text_result=None, filename=None)
+        return render_template_string(
+            PAGE,
+            message="Nessun file selezionato.",
+            text_result=None,
+            filename=None
+        )
 
     filename = file.filename
     lowername = filename.lower()
@@ -78,24 +88,59 @@ def upload():
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
     file.save(save_path)
 
-    # provo a leggere il DXF
+    # controllo dimensione dopo il salvataggio
+    file_size_mb = os.path.getsize(save_path) / (1024 * 1024)
+    if file_size_mb > MAX_FILE_MB:
+        return render_template_string(
+            PAGE,
+            message=f"File troppo grande ({file_size_mb:.1f} MB). Limite attuale: {MAX_FILE_MB} MB.",
+            text_result=None,
+            filename=filename
+        )
+
+    # provo a leggere il DXF in modo sicuro
     try:
         doc = ezdxf.readfile(save_path)
         msp = doc.modelspace()
+
         elements = []
-        for e in msp:
-            elements.append(f"{e.dxftype()}  |  layer={e.dxf.layer}")
-        text_result = "\n".join(elements[:200]) or "Nessun elemento trovato nel DXF."
-        return render_template_string(PAGE, message=None, text_result=text_result, filename=filename)
-    except Exception as e:
+        for i, e in enumerate(msp):
+            # evitiamo di elencare milioni di entità
+            if i >= 300:
+                elements.append("... (tagliato: file molto grande)")
+                break
+
+            # non tutte le entità hanno layer
+            layer = getattr(e.dxf, "layer", "sconosciuto")
+            elements.append(f"{e.dxftype()}  |  layer={layer}")
+
+        text_result = "\n".join(elements) or "Nessun elemento trovato nel DXF."
+
         return render_template_string(
             PAGE,
-            message=f"Errore nella lettura del DXF: {e}",
+            message=None,
+            text_result=text_result,
+            filename=filename
+        )
+
+    except DXFStructureError as e:
+        # DXF valido ma con struttura che ezdxf non digerisce
+        return render_template_string(
+            PAGE,
+            message=f"Il DXF è stato caricato ma ha una struttura non standard: {e}",
+            text_result=None,
+            filename=filename
+        )
+    except Exception as e:
+        # qualunque altro errore: non facciamo crashare il worker
+        return render_template_string(
+            PAGE,
+            message=f"Errore nella lettura del DXF (forse troppo complesso o prodotto da un CAD diverso): {e}",
             text_result=None,
             filename=filename
         )
 
 
 if __name__ == "__main__":
-    # questo serve solo se lo lanci in locale
+    # solo in locale
     app.run(debug=True)
