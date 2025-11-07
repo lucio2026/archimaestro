@@ -53,4 +53,4 @@ def upload():
 
 if __name__ == "__main__":
     # utile solo in locale; su Render usa gunicorn
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5055, debug=True)
