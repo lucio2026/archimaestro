@@ -1,38 +1,40 @@
 
 import os
 from flask import Flask, request, render_template_string
-import ezdxf
 
 app = Flask(__name__)
 app.secret_key = "archimaestro-secret"
 
-# cartella di upload
+# cartella per i file caricati
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# 1) limite duro di Flask: 30 MB
-app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024  # 30 MB
+# limite "normale" del server (5 MB circa su Render free)
+MAX_SIZE_MB = 5
 
-# 2) nostro limite logico
-MAX_FILE_SIZE_MB = 30
-PARSE_WITH_EZDXF_MB = 5  # sotto i 5 MB uso ezdxf, sopra leggo smart
 
-PAGE = """
+HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="it">
 <head>
     <meta charset="UTF-8">
     <title>Archimaestro Translator</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 860px; margin: 40px auto; }
-        textarea { width: 100%; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; }
+        h1 { margin-bottom: .3rem; }
+        form { margin: 1rem 0; }
+        textarea { width: 100%; }
+        #dxf-box { height: 240px; }
+        #prompt-box { height: 220px; }
         .msg { background: #ffe4e4; padding: .5rem .8rem; border: 1px solid #ffb4b4; margin-bottom: 1rem; }
-        .label { font-weight: bold; margin-bottom: .4rem; display: block; }
+        .ok { background: #e9fff0; border: 1px solid #b2f5c6; }
+        .topbar { margin-bottom: 1rem; }
+        button { cursor: pointer; }
     </style>
 </head>
 <body>
-    <h1>🏗️ Archimaestro Translator</h1>
+    <h1>🟧 Archimaestro Translator</h1>
     <p>Carica un DXF. Se è grande lo leggo in modalità “smart”. Puoi anche generare il prompt per Grock.</p>
 
     {% if message %}
@@ -41,8 +43,8 @@ PAGE = """
 
     <form action="/upload" method="post" enctype="multipart/form-data">
         <input type="file" name="file" accept=".dxf" required>
-        <button type="submit" name="action" value="analyze">Carica e analizza</button>
-        <button type="submit" name="action" value="grock">Carica e crea prompt Grock</button>
+        <button type="submit" name="mode" value="normal">Carica e analizza</button>
+        <button type="submit" name="mode" value="grock">Carica e crea prompt Grock</button>
     </form>
 
     {% if filename %}
@@ -50,142 +52,136 @@ PAGE = """
     {% endif %}
 
     {% if text_result %}
-        <div>
-            <span class="label">Elementi / righe lette:</span>
-            <textarea rows="14" readonly>{{ text_result }}</textarea>
-        </div>
+        <h3>Elementi / righe lette:</h3>
+        <textarea id="dxf-box" readonly>{{ text_result }}</textarea>
     {% endif %}
 
     {% if grock_prompt %}
-        <div style="margin-top:1rem;">
-            <span class="label">Prompt per Grock:</span>
-            <textarea rows="14" readonly>{{ grock_prompt }}</textarea>
-        </div>
+        <h3>Prompt per Grock:</h3>
+        <textarea id="prompt-box" readonly>{{ grock_prompt }}</textarea>
+        <p><button onclick="copyPrompt()">📋 Copia prompt</button></p>
     {% endif %}
+
+    <script>
+    function copyPrompt() {
+        const ta = document.getElementById('prompt-box');
+        if (!ta) return;
+        ta.select();
+        ta.setSelectionRange(0, 99999);
+        navigator.clipboard.writeText(ta.value).then(() => {
+            alert("✅ Prompt copiato negli appunti.");
+        }).catch(() => {
+            alert("Copia non riuscita, copia a mano.");
+        });
+    }
+    </script>
 </body>
 </html>
 """
 
 
-def smart_read(path: str, max_lines: int = 400) -> str:
-    """Legge il DXF come testo (riga per riga) senza caricare tutto in RAM."""
-    lines = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for i, line in enumerate(f):
-            if i >= max_lines:
-                lines.append("... (tagliato perché file grande)")
-                break
-            lines.append(line.rstrip("\n"))
-    return "\n".join(lines)
+def read_dxf_smart(path, max_lines=250):
+    """Lettura 'smart' per DXF grandi: leggo il file di testo e prendo solo le prime righe."""
+    try:
+        lines = []
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                lines.append(line.rstrip("\n"))
+        return "\n".join(lines) if lines else "Nessun contenuto leggibile."
+    except Exception as e:
+        return f"Errore lettura smart: {e}"
 
 
-def build_grock_prompt_from_counts(filename: str, by_type: dict, by_layer: dict, smart: bool = False) -> str:
-    lines = []
-    lines.append(f"Ho caricato un disegno CAD (file: {filename}).")
-    if smart:
-        lines.append("Il file era abbastanza grande, quindi ho fatto una lettura parziale (smart) del DXF.")
-    lines.append("Queste sono le entità/layer che ho rilevato:")
-
-    if by_type:
-        for t, n in by_type.items():
-            lines.append(f"- {n} entità di tipo {t}")
-    if by_layer:
-        lines.append("Per layer:")
-        for lay, n in by_layer.items():
-            lines.append(f"  - {n} oggetti sul layer “{lay}”")
-
-    lines.append("")
-    lines.append("Crea una breve animazione tecnica in 4 step:")
-    lines.append("1. mostra una base/griglia da tavola tecnica;")
-    lines.append("2. disegna prima i muri/contorni (LINE, LWPOLYLINE, layer con 'MURI' o 'PERIMETRO');")
-    lines.append("3. poi fai comparire gli elementi tecnici o di arredo;")
-    lines.append("4. alla fine mostra le scritte/cartiglio.")
-    lines.append("Stile: pulito, da presentazione architettonica.")
-    return "\n".join(lines)
+def build_grock_prompt(filename, text_excerpt):
+    """Costruisce il testo già pronto da incollare su Grock."""
+    return (
+        f"Ho caricato un disegno CAD (file: {filename}).\\n"
+        "Il file era grande, quindi ho fatto una lettura parziale (smart) del DXF.\\n"
+        "Queste sono alcune righe/entità che ho rilevato:\\n"
+        "------------------------------\\n"
+        f"{text_excerpt}\\n"
+        "------------------------------\\n"
+        "Crea una breve animazione tecnica in 4 step:\\n"
+        "1. mostra una base/griglia da tavola tecnica;\\n"
+        "2. disegna prima i muri/contorni (LINE, LWPOLYLINE, layer con 'MURI' o 'PERIMETRO');\\n"
+        "3. poi fai comparire gli elementi tecnici o di arredo;\\n"
+        "4. alla fine mostra le scritte/cartiglio.\\n"
+        "Stile: pulito, da presentazione architettonica."
+    )
 
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(PAGE, message=None, text_result=None, filename=None, grock_prompt=None)
+    return render_template_string(
+        HTML_PAGE,
+        message=None,
+        text_result=None,
+        filename=None,
+        grock_prompt=None,
+    )
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    action = request.form.get("action", "analyze")
-    file = request.files.get("file")
+    upfile = request.files.get("file")
+    mode = request.form.get("mode", "normal")
 
-    if not file or file.filename == "":
-        return render_template_string(PAGE, message="Nessun file selezionato.", text_result=None, filename=None, grock_prompt=None)
-
-    filename = file.filename
-    lowername = filename.lower()
-
-    if not lowername.endswith(".dxf"):
-        return render_template_string(PAGE, message="Accetto solo DXF. Esporta il DWG in DXF e ricarica.", text_result=None, filename=None, grock_prompt=None)
-
-    save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    file.save(save_path)
-
-    size_mb = os.path.getsize(save_path) / (1024 * 1024)
-    if size_mb > MAX_FILE_SIZE_MB:
+    if not upfile or upfile.filename == "":
         return render_template_string(
-            PAGE,
-            message=f"File troppo grande ({size_mb:.1f} MB). Limite attuale: {MAX_FILE_SIZE_MB} MB.",
+            HTML_PAGE,
+            message="Nessun file selezionato.",
             text_result=None,
-            filename=filename,
+            filename=None,
             grock_prompt=None,
         )
 
-    # se è piccolo → analisi vera
-    if size_mb <= PARSE_WITH_EZDXF_MB:
+    filename = upfile.filename
+    lowername = filename.lower()
+
+    if not lowername.endswith(".dxf"):
+        return render_template_string(
+            HTML_PAGE,
+            message="Per ora il server accetta solo DXF. Esporta il DWG in DXF e ricarica.",
+            text_result=None,
+            filename=None,
+            grock_prompt=None,
+        )
+
+    save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+    upfile.save(save_path)
+
+    # controllo dimensione
+    size_mb = os.path.getsize(save_path) / (1024 * 1024)
+
+    # se è troppo grande uso lettura smart
+    if size_mb > MAX_SIZE_MB:
+        text_result = read_dxf_smart(save_path, max_lines=300)
+        msg = f"File grande ({size_mb:.1f} MB): lettura smart eseguita."
+    else:
+        # provo a usare ezdxf normalmente
         try:
+            import ezdxf
             doc = ezdxf.readfile(save_path)
             msp = doc.modelspace()
-
-            elements = []
-            by_type = {}
-            by_layer = {}
+            lines = []
             for e in msp:
-                et = e.dxftype()
-                lay = e.dxf.layer
-                elements.append(f"{et}  |  layer={lay}")
-                by_type[et] = by_type.get(et, 0) + 1
-                by_layer[lay] = by_layer.get(lay, 0) + 1
-
-            text_result = "\n".join(elements[:200]) or "Nessun elemento trovato nel DXF."
-
-            grock_prompt = None
-            if action == "grock":
-                grock_prompt = build_grock_prompt_from_counts(filename, by_type, by_layer, smart=False)
-
-            return render_template_string(
-                PAGE,
-                message=None,
-                text_result=text_result,
-                filename=filename,
-                grock_prompt=grock_prompt,
-            )
+                lines.append(f"{e.dxftype()}  |  layer={e.dxf.layer}")
+            text_result = "\n".join(lines[:300]) or "Nessun elemento trovato nel DXF."
+            msg = None
         except Exception as e:
-            # se ezdxf fallisce, torniamo alla smart
-            text_result = smart_read(save_path)
-            return render_template_string(
-                PAGE,
-                message=f"Analisi DXF completa non riuscita ({e}). Ho fatto una lettura smart.",
-                text_result=text_result,
-                filename=filename,
-                grock_prompt=None,
-            )
+            # se fallisce uso comunque la smart
+            text_result = read_dxf_smart(save_path, max_lines=300)
+            msg = f"DXF complesso, passo alla lettura smart. Dettaglio: {e}"
 
-    # se è grande → lettura smart
-    text_result = smart_read(save_path)
     grock_prompt = None
-    if action == "grock":
-        # con file grande non abbiamo i conteggi precisi, quindi prompt generico
-        grock_prompt = build_grock_prompt_from_counts(filename, {}, {}, smart=True)
+    if mode == "grock":
+        grock_prompt = build_grock_prompt(filename, text_result[:1200])
 
     return render_template_string(
-        PAGE,
-        message=f"File grande ({size_mb:.1f} MB): lettura smart eseguita.",
+        HTML_PAGE,
+        message=msg,
         text_result=text_result,
         filename=filename,
         grock_prompt=grock_prompt,
