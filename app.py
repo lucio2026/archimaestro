@@ -1,18 +1,27 @@
 
 import os
-from flask import Flask, request, render_template_string, send_from_directory
+import uuid
+from flask import (
+    Flask,
+    request,
+    render_template_string,
+    send_from_directory,
+)
 import ezdxf
-from ezdxf.lldxf.const import DXFStructureError
 
 app = Flask(__name__)
-app.secret_key = "archimaestro-secret"
+app.secret_key = "archimaestro-smart"
 
+# cartella per i file caricati e per i risultati
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-MAX_FILE_MB = 5  # limite file
+# limiti
+MAX_FILE_MB = 50          # limite massimo accettato dal server
+PARSE_WITH_EZDXF_MB = 5   # sotto questo valore proviamo l’analisi “bella” con ezdxf
 
+# HTML INLINE
 PAGE = """
 <!DOCTYPE html>
 <html lang="it">
@@ -26,13 +35,14 @@ PAGE = """
         textarea { width: 100%; height: 320px; }
         .msg { background: #ffe4e4; padding: .5rem .8rem; border: 1px solid #ffb4b4; margin-bottom: 1rem; }
         .ok { background: #e9fff0; border: 1px solid #b2f5c6; }
-        a.btn { display:inline-block; margin-top:10px; padding:8px 12px; background:#0077cc; color:white; text-decoration:none; border-radius:4px; }
-        a.btn:hover { background:#005fa3; }
+        .download { margin-top: 1rem; }
+        a.btn { display:inline-block; padding: 6px 12px; background:#2b6cb0; color:#fff; text-decoration:none; border-radius:4px; }
+        a.btn:hover { background:#2c5282; }
     </style>
 </head>
 <body>
     <h1>🏗️ Archimaestro Translator</h1>
-    <p>Carica un file <b>DXF</b> e vedi gli elementi. Poi puoi anche scaricare il risultato.</p>
+    <p>Carica un file <b>DXF</b> e vedi gli elementi. Se è molto grande lo leggo in modalità “smart”.</p>
 
     {% if message %}
         <div class="msg">{{ message }}</div>
@@ -51,27 +61,45 @@ PAGE = """
         <textarea readonly>{{ text_result }}</textarea>
     {% endif %}
 
-    {% if download_name %}
-        <p><a class="btn" href="/download/{{ download_name }}">⬇ Scarica risultato (.txt)</a></p>
+    {% if download_id %}
+        <div class="download">
+            <a class="btn" href="{{ url_for('download_result', result_id=download_id) }}">⬇️ Scarica il risultato (.txt)</a>
+        </div>
     {% endif %}
 </body>
 </html>
 """
 
 
+def file_size_mb(path: str) -> float:
+    return os.path.getsize(path) / (1024 * 1024)
+
+
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(PAGE, message=None, text_result=None, filename=None, download_name=None)
+    return render_template_string(
+        PAGE,
+        message=None,
+        text_result=None,
+        filename=None,
+        download_id=None,
+    )
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    file = request.files.get("file")
+    upfile = request.files.get("file")
 
-    if not file or file.filename == "":
-        return render_template_string(PAGE, message="Nessun file selezionato.", text_result=None, filename=None, download_name=None)
+    if not upfile or upfile.filename == "":
+        return render_template_string(
+            PAGE,
+            message="Nessun file selezionato.",
+            text_result=None,
+            filename=None,
+            download_id=None,
+        )
 
-    filename = file.filename
+    filename = upfile.filename
     lowername = filename.lower()
 
     if not lowername.endswith(".dxf"):
@@ -80,73 +108,87 @@ def upload():
             message="Per ora il server accetta solo DXF. Esporta il DWG in DXF e ricarica.",
             text_result=None,
             filename=None,
-            download_name=None
+            download_id=None,
         )
 
+    # salviamo il file
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    file.save(save_path)
+    upfile.save(save_path)
 
-    # controllo dimensione
-    file_size_mb = os.path.getsize(save_path) / (1024 * 1024)
-    if file_size_mb > MAX_FILE_MB:
+    size_mb = file_size_mb(save_path)
+    if size_mb > MAX_FILE_MB:
         return render_template_string(
             PAGE,
-            message=f"File troppo grande ({file_size_mb:.1f} MB). Limite attuale: {MAX_FILE_MB} MB.",
+            message=f"File troppo grande ({size_mb:.1f} MB). Limite attuale: {MAX_FILE_MB} MB.",
             text_result=None,
             filename=filename,
-            download_name=None
+            download_id=None,
         )
 
+    # se il file è piccolo proviamo l'analisi vera con ezdxf
+    text_result = ""
+    info_msg = None
+
+    if size_mb <= PARSE_WITH_EZDXF_MB:
+        try:
+            doc = ezdxf.readfile(save_path)
+            msp = doc.modelspace()
+
+            elements = []
+            for e in msp:
+                elements.append(f"{e.dxftype()}  |  layer={e.dxf.layer}")
+            text_result = "\n".join(elements[:200]) or "Nessun elemento trovato nel DXF."
+        except Exception as e:
+            # fallback a lettura smart
+            info_msg = f"Analisi DXF completa non riuscita: {e}. Ho usato la lettura smart."
+            text_result = smart_read(save_path)
+    else:
+        # file grande: lettura smart
+        info_msg = (
+            f"File grande ({size_mb:.1f} MB). Ho fatto una lettura smart delle prime righe del DXF."
+        )
+        text_result = smart_read(save_path)
+
+    # salviamo il risultato in un .txt per il download
+    result_id = str(uuid.uuid4()) + ".txt"
+    result_path = os.path.join(app.config["UPLOAD_FOLDER"], result_id)
+    with open(result_path, "w", encoding="utf-8") as f:
+        f.write(text_result)
+
+    return render_template_string(
+        PAGE,
+        message=info_msg,
+        text_result=text_result,
+        filename=filename,
+        download_id=result_id,
+    )
+
+
+def smart_read(path: str, max_lines: int = 400) -> str:
+    """Legge il DXF come testo e restituisce le prime N righe.
+    Utile per file molto grandi o corrotti per ezdxf.
+    """
+    lines = []
     try:
-        doc = ezdxf.readfile(save_path)
-        msp = doc.modelspace()
-
-        elements = []
-        for i, e in enumerate(msp):
-            if i >= 300:
-                elements.append("... (tagliato: file molto grande)")
-                break
-            layer = getattr(e.dxf, "layer", "sconosciuto")
-            elements.append(f"{e.dxftype()}  |  layer={layer}")
-
-        text_result = "\n".join(elements) or "Nessun elemento trovato nel DXF."
-
-        # salviamo anche il txt così l'architetto può scaricarlo
-        txt_name = filename + ".txt"
-        txt_path = os.path.join(app.config["UPLOAD_FOLDER"], txt_name)
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(text_result)
-
-        return render_template_string(
-            PAGE,
-            message=None,
-            text_result=text_result,
-            filename=filename,
-            download_name=txt_name
-        )
-
-    except DXFStructureError as e:
-        return render_template_string(
-            PAGE,
-            message=f"Il DXF è stato caricato ma ha una struttura non standard: {e}",
-            text_result=None,
-            filename=filename,
-            download_name=None
-        )
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                lines.append(line.rstrip("\n"))
     except Exception as e:
-        return render_template_string(
-            PAGE,
-            message=f"Errore nella lettura del DXF (forse troppo complesso): {e}",
-            text_result=None,
-            filename=filename,
-            download_name=None
-        )
+        return f"Impossibile leggere il DXF in modalità smart: {e}"
+    return "\n".join(lines)
 
 
-@app.route("/download/<path:fname>")
-def download(fname):
-    # restituisce il txt salvato
-    return send_from_directory(app.config["UPLOAD_FOLDER"], fname, as_attachment=True)
+@app.route("/download/<result_id>")
+def download_result(result_id):
+    # il file sta in uploads
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"],
+        result_id,
+        as_attachment=True,
+        download_name="archimaestro_risultato.txt",
+    )
 
 
 if __name__ == "__main__":
